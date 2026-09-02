@@ -1,48 +1,40 @@
-# DarkCore Android Client — Background MVP
+# DarkCore Client - Camera/Microphone Test Build
 
-This version is configured for:
+This is based on the previously working Android project.
 
-`https://remote-test.shoujansapkota.com.np`
+## What changed
+- Automatic connection to `https://remote-test.shoujansapkota.com.np` on launch.
+- Camera, microphone and notification permissions are requested together when missing.
+- Visible foreground service notification.
+- Host `request_camera` starts a camera test stream after Android permissions have been granted.
+- Host `stop_camera` stops it.
+- Host `request_microphone` starts a microphone test stream after Android permissions have been granted.
+- Host `stop_microphone` stops it.
+- Camera frames are sent as JPEG/base64 WebSocket messages at about 5 fps.
+- Microphone audio is sent as 16 kHz mono 16-bit PCM/base64 chunks.
 
-It connects to:
+## Important Android behavior
+Android's camera/microphone permission and foreground-service rules remain enforced. The app does not bypass permission dialogs or hide active sensor use. A visible notification changes to indicate camera/microphone sharing is active.
 
-`wss://remote-test.shoujansapkota.com.np/ws`
+## Build
+GitHub Actions builds `app-debug.apk` and uploads it as `darkcore-client-camera-mic-debug-apk`.
 
-## Background behavior
+## Protocol
+Camera frame:
+`{"type":"camera_frame","mime":"image/jpeg","data":"..."}`
 
-The connection is maintained by an Android Foreground Service.
+Microphone chunk:
+`{"type":"audio_chunk","sample_rate":16000,"channels":1,"encoding":"pcm_s16le","data":"..."}`
 
-It:
-- shows a persistent DarkCore notification
-- uses `START_STICKY` so Android can recreate the service after some process deaths
-- uses OkHttp WebSocket pinging
-- reconnects after network failures with exponential backoff up to 60 seconds
-- handles disconnect/reconnect status
+The Host must decode these messages to display/play them.
 
-### Important Android limitation
+## Screen sharing test mode
 
-No normal Android application can guarantee "always alive forever". Android, the user, OEM battery management, force-stop, reboot, system policy, or loss of internet can stop it. The app therefore uses the supported Foreground Service mechanism and a visible notification instead of trying to bypass Android restrictions.
+This version adds Android MediaProjection screen sharing. The user must approve the Android system screen-capture dialog. After approval, the active projection session is maintained by the foreground service until it is stopped or Android ends it.
 
-For testing, allow notifications and, if your phone manufacturer provides battery optimization controls, set DarkCore to the normal "Unrestricted"/"Don't optimize" option. Do not disable Android security features.
+Host control messages:
+- `request_screen`
+- `stop_screen`
 
-## Build online
-
-Upload this project to GitHub, then use:
-
-Actions → Build DarkCore Android APK → Run workflow
-
-Download the `darkcore-client-debug-apk` artifact.
-
-## Test
-
-1. Keep the Windows DarkCore Host running.
-2. Keep `cloudflared tunnel ... run` running.
-3. Verify the public `/health` endpoint.
-4. Install this APK.
-5. Use mobile data on Android.
-6. Press CONNECT.
-7. Lock the phone.
-8. Confirm the persistent DarkCore notification remains.
-9. On the Host, check that the client remains connected.
-
-This is a connectivity/background-service MVP. It does not include hidden operation, keylogging, credential capture, security bypass, or stealth functionality.
+Client media message:
+- `screen_frame` with JPEG data in Base64
