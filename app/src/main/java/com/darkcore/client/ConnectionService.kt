@@ -337,7 +337,7 @@ class ConnectionService : Service() {
                     }
                 }
             }.also { it.start() }
-        } catch (SecurityException) {
+      } catch (e: SecurityException) {
             sendError("Microphone permission/security restriction")
             stopMicrophone()
         } catch (e: Exception) {
